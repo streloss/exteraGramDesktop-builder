@@ -1,0 +1,235 @@
+name: Build exteraGram Desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Upstream branch to build (dev or master)'
+        required: true
+        default: 'dev'
+      enable_lto:
+        description: 'Enable Link-Time Optimization (slower build, smaller binary)'
+        required: true
+        type: boolean
+        default: false
+      create_release:
+        description: 'Create a GitHub Release with the binary'
+        required: false
+        type: boolean
+        default: true
+
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build.yml'
+      - '.github/scripts/**'
+      - 'patches/**'
+
+permissions:
+  contents: write
+
+env:
+  TDESKTOP_API_ID: "2040"
+  TDESKTOP_API_HASH: "b18441a1ff607e10a989891a5462e627"
+  DESKTOP_APP_ENABLE_LTO: ${{ (inputs.enable_lto == true || github.event.inputs.enable_lto == 'true') && 'ON' || 'OFF' }}
+
+jobs:
+  windows-x64:
+    name: Build Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Clean runner disk space
+        run: |
+          if exist "C:\Program Files\Android" rmdir /s /q "C:\Program Files\Android"
+          if exist "C:\hostedtoolcache\windows" rmdir /s /q "C:\hostedtoolcache\windows"
+          if exist "C:\Program Files\dotnet" rmdir /s /q "C:\Program Files\dotnet"
+          if exist "C:\mysql" rmdir /s /q "C:\mysql"
+          net stop SQLWriter 2>nul || ver >nul
+          taskkill /F /IM sqlwriter.exe /T 2>nul || ver >nul
+          taskkill /F /IM sqlservr.exe /T 2>nul || ver >nul
+          if exist "C:\Program Files\Microsoft SQL Server" rmdir /s /q "C:\Program Files\Microsoft SQL Server"
+          exit /b 0
+
+      - name: Expand virtual memory (Pagefile)
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 16GB
+          maximum-size: 32GB
+          disk-root: "C:"
+
+      - name: Setup environment
+        shell: bash
+        run: |
+          mkdir -p "$USERPROFILE/TBuild/Libraries"
+          echo "TBUILD=$GITHUB_WORKSPACE/TBuild" >> $GITHUB_ENV
+          echo "LibrariesPath=$GITHUB_WORKSPACE/TBuild/Libraries/x64" >> $GITHUB_ENV
+
+          SDK="10.0.26100.0"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+          sed -i '/CMAKE_${lang}_FLAGS_DEBUG_INIT/s/${_Zi}//' \
+            "$PROGRAMFILES"/CMake/share/cmake*/Modules/Platform/Windows-MSVC.cmake
+
+          git config --global user.email "exteraGramBuilder@users.noreply.github.com"
+          git config --global user.name "exteraGram CI"
+
+      - name: Create TBuild symlink
+        run: mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+
+      - name: Clone upstream C++ codebase (AyuGramDesktop)
+        run: |
+          git clone --recursive --depth 1 --shallow-submodules --jobs %NUMBER_OF_PROCESSORS% ^
+            --branch "${{ inputs.branch || 'dev' }}" --filter=blob:none ^
+            https://github.com/AyuGram/AyuGramDesktop.git "%TBUILD%\exteraGram"
+        shell: cmd
+
+      - name: Read version and setup cache key
+        shell: bash
+        run: |
+          VFILE="$TBUILD/exteraGram/Telegram/build/version"
+          VERSION=$(grep 'AppVersionStr ' "$VFILE" | awk '{ print $2 }' | tr -d '"')
+          VERSION_NUM=$(grep 'AppVersion ' "$VFILE" | awk '{ print $2 }')
+          echo "APP_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "APP_VERSION_NUM=$VERSION_NUM" >> $GITHUB_ENV
+          echo "Detected upstream version: $VERSION ($VERSION_NUM)"
+
+          PREP="$TBUILD/exteraGram/Telegram/build/prepare/prepare.py"
+          echo "$(sha256sum "$PREP" | awk '{ print $1 }')" > CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+
+      - name: Setup MSVC development environment
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+
+      - name: Configure NuGet sources
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      - name: Cache ThirdParty dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TBUILD }}/ThirdParty
+          key: ${{ runner.OS }}-x64-thirdparty-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-x64-thirdparty-
+
+      - name: Cache compiled libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.LibrariesPath }}/*
+            !${{ env.LibrariesPath }}/cache_keys
+            !${{ env.LibrariesPath }}/[qQ]t[_-]*
+            ${{ env.LibrariesPath }}/cache_keys/*
+            !${{ env.LibrariesPath }}/cache_keys/[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-libs-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-x64-libs-
+
+      - name: Cache Qt binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.LibrariesPath }}/[qQ]t[_-]*
+            ${{ env.LibrariesPath }}/cache_keys/[qQ]t[_-]*
+          key: ${{ runner.OS }}-x64-qt-${{ env.CACHE_KEY }}
+          restore-keys: ${{ runner.OS }}-x64-qt-
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply exteraGram branding and custom patches
+        shell: bash
+        run: |
+          python .github/scripts/patch_branding.py --target "$TBUILD/exteraGram"
+
+      - name: Prepare build dependencies
+        shell: cmd
+        run: |
+          cd "%TBUILD%\exteraGram"
+          python Telegram\build\prepare\prepare.py -p win64 -g "Ninja Multi-Config" --no-qt
+
+      - name: Build Qt (if not cached)
+        shell: cmd
+        run: |
+          cd "%TBUILD%\exteraGram"
+          python Telegram\build\prepare\prepare.py -p win64 -g "Ninja Multi-Config" --qt-only
+
+      - name: Configure CMake
+        shell: cmd
+        run: |
+          cmake -B "%TBUILD%\exteraGram\out" ^
+            -S "%TBUILD%\exteraGram" ^
+            -G "Ninja Multi-Config" ^
+            -DCMAKE_CONFIGURATION_TYPES=Release ^
+            -DTDESKTOP_API_ID="%TDESKTOP_API_ID%" ^
+            -DTDESKTOP_API_HASH="%TDESKTOP_API_HASH%" ^
+            -DDESKTOP_APP_ENABLE_LTO="%DESKTOP_APP_ENABLE_LTO%"
+
+      - name: Compile exteraGram Desktop
+        shell: cmd
+        run: |
+          cmake --build "%TBUILD%\exteraGram\out" --config Release --target Telegram
+
+      - name: Package exteraGram Desktop x64
+        shell: bash
+        run: |
+          OUT_DIR="$TBUILD/exteraGram/out/Release"
+          DIST_DIR="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$DIST_DIR"
+
+          if [ -f "$OUT_DIR/Telegram.exe" ]; then
+            cp "$OUT_DIR/Telegram.exe" "$DIST_DIR/exteraGram.exe"
+          elif [ -f "$OUT_DIR/exteraGram.exe" ]; then
+            cp "$OUT_DIR/exteraGram.exe" "$DIST_DIR/exteraGram.exe"
+          fi
+
+          cd "$DIST_DIR"
+          7z a -tzip -mx=9 "exteraGram-Desktop-x64.zip" exteraGram.exe
+          echo "Package created: $DIST_DIR/exteraGram-Desktop-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: exteraGram-Desktop-x64
+          path: dist/exteraGram-Desktop-x64.zip
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release == true || github.event_name == 'push' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.APP_VERSION || '1.0.0' }}-desktop
+          name: exteraGram Desktop v${{ env.APP_VERSION || '1.0.0' }} (Windows x64)
+          body: |
+            ## 🚀 exteraGram Desktop (Windows x64)
+            
+            Нативный десктопный клиент с функционалом Ghost Mode и сохранением удаленных сообщений.
+            
+            ### ✨ Возможности:
+            - **Ghost Mode**: скрытие статуса «В сети», скрытие прочтения сообщений и просмотров историй.
+            - **Anti-Delete**: сохранение удалённых сообщений и истории редактирования.
+            - **Брендинг exteraGram**: кастомный интерфейс и оптимизированная сборка.
+            - **Отключение рекламы и спонсорских постов**.
+            
+            ### 📦 Установка:
+            1. Скачайте `exteraGram-Desktop-x64.zip`.
+            2. Распакуйте в удобную папку (например, `C:\Program Files\exteraGram` или на Рабочий стол).
+            3. Запустите `exteraGram.exe`.
+          files: dist/exteraGram-Desktop-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
