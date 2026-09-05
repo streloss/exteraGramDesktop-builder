@@ -24,7 +24,7 @@ on:
     paths:
       - '.github/workflows/build.yml'
       - '.github/scripts/**'
-      - 'patches/**'
+      - 'resources/**'
 
 permissions:
   contents: write
@@ -155,59 +155,77 @@ jobs:
       - name: Apply exteraGram branding and custom patches
         shell: bash
         run: |
-          python .github/scripts/patch_branding.py --target "$TBUILD/exteraGram"
+          python "$GITHUB_WORKSPACE/.github/scripts/patch_branding.py" --target "$TBUILD/exteraGram"
 
-      - name: Prepare build dependencies
-        shell: cmd
+      - name: Build libraries
+        env:
+          GYP_MSVS_OVERRIDE_PATH: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\'
+          GYP_MSVS_VERSION: 2022
         run: |
-          cd "%TBUILD%\exteraGram"
-          python Telegram\build\prepare\prepare.py -p win64 -g "Ninja Multi-Config" --no-qt
+          %TBUILD%\exteraGram\Telegram\build\prepare\win.bat silent
 
-      - name: Build Qt (if not cached)
-        shell: cmd
+      - name: Free intermediate disk space
+        shell: bash
         run: |
-          cd "%TBUILD%\exteraGram"
-          python Telegram\build\prepare\prepare.py -p win64 -g "Ninja Multi-Config" --qt-only
+          if [ -d "$LibrariesPath" ]; then
+            find $LibrariesPath \
+              '(' \
+                '(' \
+                  ! '(' \
+                    -name '*.lib' -o -name '*.a' -o -name '*.exe' \
+                    -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' \
+                    -o -name '*.cmake' -o -path '*/include/*' \
+                    -o -path '*/objects-*' -o -path '*/cache_keys/*' \
+                    -o -path '*/patches/*' \
+                  ')' \
+                  -type f \
+                ')' \
+                -o -empty \
+              ')' -delete
+          fi
 
-      - name: Configure CMake
-        shell: cmd
+      - name: Configure and build exteraGram
         run: |
-          cmake -B "%TBUILD%\exteraGram\out" ^
-            -S "%TBUILD%\exteraGram" ^
-            -G "Ninja Multi-Config" ^
-            -DCMAKE_CONFIGURATION_TYPES=Release ^
-            -DTDESKTOP_API_ID="%TDESKTOP_API_ID%" ^
-            -DTDESKTOP_API_HASH="%TDESKTOP_API_HASH%" ^
-            -DDESKTOP_APP_ENABLE_LTO="%DESKTOP_APP_ENABLE_LTO%"
-
-      - name: Compile exteraGram Desktop
-        shell: cmd
-        run: |
-          cmake --build "%TBUILD%\exteraGram\out" --config Release --target Telegram
+          cd %TBUILD%\exteraGram\Telegram
+          call configure.bat ^
+            x64 ^
+            -D TDESKTOP_API_ID=%TDESKTOP_API_ID% ^
+            -D TDESKTOP_API_HASH=%TDESKTOP_API_HASH% ^
+            -D CMAKE_CONFIGURATION_TYPES=Release ^
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=OFF ^
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON ^
+            -D DESKTOP_APP_ENABLE_LTO=%DESKTOP_APP_ENABLE_LTO%
+          cmake --build ..\out --config Release --parallel %NUMBER_OF_PROCESSORS%
 
       - name: Package exteraGram Desktop x64
         shell: bash
         run: |
-          OUT_DIR="$TBUILD/exteraGram/out/Release"
+          OUT="$TBUILD/exteraGram/out/Release"
           DIST_DIR="$GITHUB_WORKSPACE/dist"
           mkdir -p "$DIST_DIR"
 
-          if [ -f "$OUT_DIR/Telegram.exe" ]; then
-            cp "$OUT_DIR/Telegram.exe" "$DIST_DIR/exteraGram.exe"
-          elif [ -f "$OUT_DIR/exteraGram.exe" ]; then
-            cp "$OUT_DIR/exteraGram.exe" "$DIST_DIR/exteraGram.exe"
-          fi
+          for f in AyuGram.exe Telegram.exe exteraGram.exe; do
+            if [ -f "$OUT/$f" ]; then
+              cp "$OUT/$f" "$DIST_DIR/exteraGram.exe"
+              echo "Found executable: $f -> dist/exteraGram.exe"
+              break
+            fi
+          done
 
+          [ -f "$OUT/Updater.exe" ] && cp "$OUT/Updater.exe" "$DIST_DIR/"
+          [ -d "$OUT/modules" ] && cp -r "$OUT/modules" "$DIST_DIR/"
+
+          find "$DIST_DIR" -name '*.pdb' -o -name '*.ilk' -o -name '*.exp' | xargs rm -f 2>/dev/null || true
           cd "$DIST_DIR"
-          7z a -tzip -mx=9 "exteraGram-Desktop-x64.zip" exteraGram.exe
-          echo "Package created: $DIST_DIR/exteraGram-Desktop-x64.zip"
+          7z a -tzip -mx=9 "$GITHUB_WORKSPACE/exteraGram-Desktop-x64.zip" .
+          echo "Package created: $GITHUB_WORKSPACE/exteraGram-Desktop-x64.zip"
 
-      - name: Upload artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: exteraGram-Desktop-x64
-          path: dist/exteraGram-Desktop-x64.zip
-          retention-days: 14
+          path: exteraGram-Desktop-x64.zip
+          retention-days: 30
 
       - name: Create GitHub Release
         if: ${{ inputs.create_release == true || github.event_name == 'push' }}
@@ -230,6 +248,6 @@ jobs:
             1. Скачайте `exteraGram-Desktop-x64.zip`.
             2. Распакуйте в удобную папку (например, `C:\Program Files\exteraGram` или на Рабочий стол).
             3. Запустите `exteraGram.exe`.
-          files: dist/exteraGram-Desktop-x64.zip
+          files: exteraGram-Desktop-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
